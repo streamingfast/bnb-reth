@@ -1,0 +1,27 @@
+# Changelog
+
+All notable changes to the StreamingFast Firehose fork of bnb-chain/reth are documented here.
+
+This changelog covers Firehose-specific changes only. For upstream changes, see the
+[bnb-chain/reth releases](https://github.com/bnb-chain/reth/releases).
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+
+## v0.0.10-fh-beta
+
+### Added
+
+- Initial Firehose instrumentation on top of bnb-chain/reth `v0.0.10`, ported from
+  streamingfast/reth `firehose/2.x` (`v2.3.0-fh-6`). Includes the `reth-firehose` crate
+  (inspector, block tracer, executor wrappers, ExEx), live engine-tree tracing on both the
+  standard and triedb validation paths, pipeline (staged sync) tracing, and the
+  `Dockerfile.sf` / `sf-release.yml` image build that bundles `fireeth`.
+
+### Changed
+
+- Adapted to this fork's dependency set (reth 2.2 base): revm 38 and alloy-evm 0.34, with
+  `alloy-evm` patched to `streamingfast/evm` branch `sf/v0.34.0` so system calls
+  (EIP-4788, EIP-2935, ...) are routed through the inspector.
+- EIP-4788 / EIP-2935 system calls are reported with `gas_limit` 30000000 (the EIP-specified
+  system-call gas limit, matching geth), instead of the 31566720 reported by the revm 40 based
+  `firehose/2.x` fork. Golden test blocks were re-blessed accordingly.
