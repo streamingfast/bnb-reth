@@ -78,7 +78,7 @@ use reth_payload_primitives::{
 };
 use reth_primitives_traits::{
     AlloyBlockHeader, BlockBody, BlockTy, FastInstant as Instant, GotExpected, NodePrimitives,
-    RecoveredBlock, SealedBlock, SealedHeader, SignerRecoverable,
+    RecoveredBlock, SealedBlock, SealedHeader, SignerRecoverable, TxTy,
 };
 use reth_provider::{
     providers::{OverlayBuilder, OverlayStateProviderFactory},
@@ -389,6 +389,7 @@ where
     where
         V: PayloadValidator<T, Block = N::Block>,
         Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = N>,
+        TxTy<N>: reth_firehose::mapper::SignatureFields,
     {
         /// A helper macro for handling errors after the input has been converted to a block
         macro_rules! ensure_ok_post_block {
@@ -403,6 +404,39 @@ where
                 }
             };
         }
+
+        // Firehose: the tracer must observe the full sealed block before execution starts, so
+        // convert payloads eagerly and continue with the `Block` variant. Conversion still
+        // happens exactly once — later `self.convert_to_block(input)` calls on a `Block` variant
+        // simply unwrap it.
+        let input = if reth_firehose::is_tracer_initialized() {
+            match input {
+                BlockOrPayload::Payload(_) => BlockOrPayload::Block(self.convert_to_block(input)?),
+                block => block,
+            }
+        } else {
+            input
+        };
+
+        // Firehose: start a block tracer guard for the live engine path (triedb variant). Any
+        // early return before `mark_verified()` drops the guard, emitting
+        // `on_block_end(Some(err))` so invalid blocks are never flushed downstream.
+        let mut fh_tracer: Option<reth_firehose::FirehoseBlockTracer> =
+            if reth_firehose::is_tracer_initialized() {
+                match &input {
+                    BlockOrPayload::Block(sealed) => {
+                        let finalized = reth_firehose::mapper::finalized_ref_from_num_hash(
+                            ctx.canonical_in_memory_state().get_finalized_num_hash(),
+                        );
+                        let tracer =
+                            reth_firehose::FirehoseBlockTracer::start::<N>(sealed, finalized);
+                        (!tracer.is_genesis()).then_some(tracer)
+                    }
+                    BlockOrPayload::Payload(_) => None,
+                }
+            } else {
+                None
+            };
 
         let parent_hash = input.parent_hash();
         let block_num_hash = input.num_hash();
@@ -497,13 +531,24 @@ where
 
         let execution_start = Instant::now();
         // Execute the block and handle any execution errors.
-        let (output, senders, receipt_root_rx) =
+        let (output, senders, receipt_root_rx) = if let Some(ref mut tracer) = fh_tracer {
+            // Firehose-traced execution path: executes with FirehoseInspector so live blocks
+            // from the engine tree emit tracer events. Early returns drop the guard which calls
+            // on_block_end(Some(err)).
+            match self.execute_and_trace_block(state_provider, env, &input, &mut handle, tracer) {
+                Ok(result) => result,
+                Err(e) => {
+                    return Err(InsertBlockError::new(self.convert_to_block(input)?, e).into())
+                }
+            }
+        } else {
             match self.execute_block(state_provider, env, &input, &mut handle) {
                 Ok(result) => result,
                 Err(e) => {
                     return Err(InsertBlockError::new(self.convert_to_block(input)?, e).into())
                 }
-            };
+            }
+        };
 
         self.metrics
             .block_validation
@@ -638,6 +683,13 @@ where
             let _ = valid_block_tx.send(());
         }
 
+        // All post-execution validations passed — flush the Firehose block. Placed after the last
+        // fallible step so any earlier failure instead drops the guard (emitting
+        // `on_block_end(Some(err))`) and discards the block.
+        if let Some(guard) = fh_tracer.take() {
+            guard.mark_verified();
+        }
+
         Ok((
             ExecutedBlock {
                 recovered_block: Arc::new(block),
@@ -675,6 +727,7 @@ where
     where
         V: PayloadValidator<T, Block = N::Block> + Clone,
         Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = N>,
+        TxTy<N>: reth_firehose::mapper::SignatureFields,
     {
         if rust_eth_triedb::triedb_manager::is_triedb_active() {
             // Track which triedb validation path is used and how long it takes.
@@ -719,10 +772,60 @@ where
             BlockOrPayload::Block(_) => Either::Right(()),
         };
 
+        // Firehose: the tracer must observe the full sealed block before execution starts. For
+        // payloads this means waiting on the background conversion task eagerly; the resolved
+        // block is then handed back to `convert_to_block` below so conversion still happens
+        // exactly once.
+        let (convert_to_block, fh_resolved): (_, Option<SealedBlock<N::Block>>) =
+            if reth_firehose::is_tracer_initialized() {
+                match convert_to_block {
+                    Either::Left(handle) => {
+                        let sealed = handle.try_into_inner().expect("sole handle")?;
+                        (Either::Right(()), Some(sealed))
+                    }
+                    right => (right, None),
+                }
+            } else {
+                (convert_to_block, None)
+            };
+
+        // Firehose: start a block tracer guard for the live engine path.
+        //
+        // If any early return is taken between here and `mark_verified()`, the guard's Drop
+        // emits `on_block_end(Some(err))` so invalid blocks are never flushed downstream.
+        //
+        // `finalized` advertises the last finalized head known to the node. On the live engine
+        // path this is set by forkchoiceUpdated (via `set_finalized` on the in-memory state), so
+        // it may lag the block being validated by a few slots — that's the correct Firehose
+        // semantics: each block carries the finalized head as of its execution.
+        //
+        // Block 1 is the genesis marker: `start` emits `on_genesis_block` as a
+        // standalone event and does NOT leave the tracer in "block state", so wrapping the
+        // executor would panic in `on_system_call_start`.
+        let mut fh_tracer: Option<reth_firehose::FirehoseBlockTracer> =
+            if reth_firehose::is_tracer_initialized() {
+                let sealed: Option<&SealedBlock<N::Block>> = match (&fh_resolved, &input) {
+                    (Some(block), _) | (None, BlockOrPayload::Block(block)) => Some(block),
+                    _ => None,
+                };
+                sealed.and_then(|sealed| {
+                    let finalized = reth_firehose::mapper::finalized_ref_from_num_hash(
+                        ctx.canonical_in_memory_state().get_finalized_num_hash(),
+                    );
+                    let tracer = reth_firehose::FirehoseBlockTracer::start::<N>(sealed, finalized);
+                    (!tracer.is_genesis()).then_some(tracer)
+                })
+            } else {
+                None
+            };
+
         // Returns the sealed block, either by awaiting the background conversion task (for
         // payloads) or by extracting the already-converted block directly.
         let convert_to_block =
             move |input: BlockOrPayload<T>| -> Result<SealedBlock<N::Block>, NewPayloadError> {
+                if let Some(block) = fh_resolved {
+                    return Ok(block)
+                }
                 match convert_to_block {
                     Either::Left(handle) => handle.try_into_inner().expect("sole handle"),
                     Either::Right(()) => {
@@ -870,11 +973,21 @@ where
         // The receipt root task is spawned before execution and receives receipts incrementally
         // as transactions complete, allowing parallel computation during execution.
         let execute_block_start = Instant::now();
-        let (output, senders, receipt_root_rx) =
+        let (output, senders, receipt_root_rx) = if let Some(ref mut tracer) = fh_tracer {
+            // Firehose-traced execution path: executes with FirehoseInspector so live
+            // blocks from the engine tree (newPayload/FCU path) emit tracer events. The tracer
+            // guard is kept alive until mark_verified() below; any early return drops the guard
+            // which calls on_block_end(Some(err)).
+            match self.execute_and_trace_block(state_provider, env, &input, &mut handle, tracer) {
+                Ok(output) => output,
+                Err(err) => return self.handle_execution_error(input, err, &parent_block),
+            }
+        } else {
             match self.execute_block(state_provider, env, &input, &mut handle) {
                 Ok(output) => output,
                 Err(err) => return self.handle_execution_error(input, err, &parent_block),
-            };
+            }
+        };
         let execution_duration = execute_block_start.elapsed();
 
         // After executing the block we can stop prewarming transactions
@@ -1149,6 +1262,13 @@ where
         // avoiding a long-lived reader that blocks MDBX GC during write commits.
         ensure_ok_post_block!(overlay_factory.database_provider_ro(), block);
 
+        // All post-execution validations passed — flush the Firehose block. Placed after the last
+        // fallible step so any earlier failure instead drops the guard (emitting
+        // `on_block_end(Some(err))`) and discards the block.
+        if let Some(guard) = fh_tracer.take() {
+            guard.mark_verified();
+        }
+
         let executed_block = self.spawn_deferred_trie_task(
             block,
             output,
@@ -1324,6 +1444,142 @@ where
         self.metrics.record_block_execution(&output, execution_duration);
         self.metrics.record_block_execution_gas_bucket(output.result.gas_used, execution_duration);
         debug!(target: "engine::tree::payload_validator", elapsed = ?execution_duration, "Executed block");
+
+        Ok((output, senders, result_rx))
+    }
+
+    /// Firehose-enabled twin of [`Self::execute_block`].
+    ///
+    /// This is a near line-for-line copy of `execute_block` with two surgical differences:
+    ///   - the EVM is constructed via `evm_with_env_and_inspector` with a `FirehoseInspector`
+    ///     borrowed from the supplied `tracer`;
+    ///   - the resulting executor is wrapped in a
+    ///     [`reth_firehose::executor::FirehoseWrappedExecutor`] so system-call boundaries and
+    ///     withdrawals are funnelled into the tracer.
+    ///
+    /// MAINTENANCE CONTRACT: keep this function in sync with [`Self::execute_block`]. Any change
+    /// to the upstream logic (new metrics, error handling, ordering of pre/post steps, etc.) must
+    /// be mirrored here. The intent of duplicating rather than branching is to keep the diff
+    /// against upstream minimal and localized: upstream's `execute_block` stays pristine, and the
+    /// Firehose-specific wiring lives here.
+    #[expect(clippy::type_complexity)]
+    fn execute_and_trace_block<S, Err, T>(
+        &mut self,
+        state_provider: S,
+        env: ExecutionEnv<Evm>,
+        input: &BlockOrPayload<T>,
+        handle: &mut PayloadHandle<impl ExecutableTxFor<Evm>, Err, N::Receipt>,
+        tracer: &mut reth_firehose::FirehoseBlockTracer,
+    ) -> Result<
+        (
+            BlockExecutionOutput<N::Receipt>,
+            Vec<Address>,
+            tokio::sync::oneshot::Receiver<(B256, alloy_primitives::Bloom)>,
+        ),
+        InsertBlockErrorKind,
+    >
+    where
+        S: StateProvider + Send,
+        Err: core::error::Error + Send + Sync + 'static,
+        V: PayloadValidator<T, Block = N::Block>,
+        T: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>,
+        Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = N>,
+        TxTy<N>: reth_firehose::mapper::SignatureFields,
+    {
+        debug!(target: "engine::tree::payload_validator", "Executing block (with Firehose tracing)");
+
+        let mut db = debug_span!(target: "engine::tree", "build_state_db").in_scope(|| {
+            State::builder()
+                .with_database(StateProviderDatabase::new(state_provider))
+                .with_bundle_update()
+                .build()
+        });
+
+        let (spec_id, mut inner_executor) = {
+            let _span = debug_span!(target: "engine::tree", "create_evm").entered();
+            let spec_id = *env.evm_env.spec_id();
+            // Firehose-specific: install the inspector on the EVM so system-call boundaries and
+            // per-tx events are forwarded to the tracer.
+            let inspector = tracer.inspector();
+            let evm = self.evm_config.evm_with_env_and_inspector(&mut db, env.evm_env, inspector);
+            let ctx = self
+                .execution_ctx_for(input)
+                .map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?;
+            let inner = self.evm_config.create_executor(evm, ctx);
+            (spec_id, inner)
+        };
+
+        if !self.config.precompile_cache_disabled() {
+            let _span = debug_span!(target: "engine::tree", "setup_precompile_cache").entered();
+            inner_executor.evm_mut().precompiles_mut().map_cacheable_precompiles(
+                |address, precompile| {
+                    let metrics = self
+                        .precompile_cache_metrics
+                        .entry(*address)
+                        .or_insert_with(|| CachedPrecompileMetrics::new_with_address(*address))
+                        .clone();
+                    CachedPrecompile::wrap(
+                        precompile,
+                        self.precompile_cache_map.cache_for_address(*address),
+                        spec_id,
+                        Some(metrics),
+                    )
+                },
+            );
+        }
+
+        // Spawn background task to compute receipt root and logs bloom incrementally.
+        // Unbounded channel is used since tx count bounds capacity anyway (max ~30k txs per block).
+        let receipts_len = input.transaction_count();
+        let (receipt_tx, receipt_rx) = crossbeam_channel::unbounded();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let task_handle = ReceiptRootTaskHandle::new(receipt_rx, result_tx);
+        self.payload_processor
+            .executor()
+            .spawn_blocking_named("receipt-root", move || task_handle.run(receipts_len));
+
+        let transaction_count = input.transaction_count();
+        let executed_tx_index = Arc::clone(handle.executed_tx_index());
+        let inner_executor = inner_executor.with_state_hook(
+            handle.state_hook().map(|hook| Box::new(hook) as Box<dyn OnStateHook>),
+        );
+
+        // Firehose-specific: wrap the inner executor so EIP-4895 withdrawal balance changes and
+        // system-call boundaries are emitted as tracer events.
+        let withdrawals =
+            input.withdrawals().map(|w| alloy_eips::eip4895::Withdrawals::new(w.to_vec()));
+        let executor =
+            reth_firehose::executor::FirehoseWrappedExecutor::new(inner_executor, withdrawals);
+
+        let execution_start = Instant::now();
+
+        // Execute all transactions and finalize
+        let (executor, senders) = self.execute_transactions(
+            executor,
+            transaction_count,
+            handle.iter_transactions(),
+            &receipt_tx,
+            &executed_tx_index,
+        )?;
+        drop(receipt_tx);
+
+        // Finish execution and get the result
+        let post_exec_start = Instant::now();
+        let (_evm, result) = debug_span!(target: "engine::tree", "BlockExecutor::finish")
+            .in_scope(|| executor.finish())
+            .map(|(evm, result)| (evm.into_db(), result))?;
+        self.metrics.record_post_execution(post_exec_start.elapsed());
+
+        // Merge transitions into bundle state
+        debug_span!(target: "engine::tree", "merge_transitions")
+            .in_scope(|| db.merge_transitions(BundleRetention::Reverts));
+
+        let output = BlockExecutionOutput { result, state: db.take_bundle() };
+
+        let execution_duration = execution_start.elapsed();
+        self.metrics.record_block_execution(&output, execution_duration);
+        self.metrics.record_block_execution_gas_bucket(output.result.gas_used, execution_duration);
+        debug!(target: "engine::tree::payload_validator", elapsed = ?execution_duration, "Executed block (with Firehose tracing)");
 
         Ok((output, senders, result_rx))
     }
@@ -2320,6 +2576,7 @@ where
     V: PayloadValidator<Types, Block = N::Block> + Clone,
     Evm: ConfigureEngineEvm<Types::ExecutionData, Primitives = N> + 'static,
     Types: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>,
+    TxTy<N>: reth_firehose::mapper::SignatureFields,
 {
     fn validate_payload_attributes_against_header(
         &self,

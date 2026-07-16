@@ -50,6 +50,8 @@ members = [
     "crates/exex/exex/",
     "crates/exex/test-utils/",
     "crates/exex/types/",
+    "crates/firehose",
+    "crates/firehose-tests",
     "crates/metrics/",
     "crates/net/banlist/",
     "crates/net/discv4/",
@@ -708,6 +710,24 @@ vergen-git2 = "9.1.0"
 
 # networking
 ipnet = "2.11"
+
+## Firehose Additions
+firehose-tracer = "5"
+reth-firehose = { path = "crates/firehose" }
+reth-firehose-tests = { path = "crates/firehose-tests" }
+
+[patch.crates-io]
+## Firehose additions
+# SF fork of alloy-evm that routes system calls (EIP-4788, EIP-2935, etc.) through the Inspector.
+# See https://github.com/alloy-rs/evm/pull/323 for the upstream PR.
+alloy-evm = { git = "https://github.com/streamingfast/evm.git", branch = "sf/v0.34.0" }
+
+## Firehose additions
+# This is needed otherwise we get flooding of debug logs around a problem that seems to happen in Reth directly.
+# This is about wrong execution pool and could be related to ExEx in general (not just our version). We will
+# need to investigate to ensure we are not doing wrong thing that could hinder threading in production.
+[profile.dev.package.reth-chain-state]
+debug-assertions = false
 
 [patch."https://github.com/bnb-chain/reth-bsc-triedb.git"]
 reth-metrics = { path = "crates/metrics" }

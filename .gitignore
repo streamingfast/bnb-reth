@@ -78,3 +78,6 @@ __pycache__/
 
 # Claude Code session files
 .claude/
+.dev/tasks.md
+.dev/todo/
+/.worktrees

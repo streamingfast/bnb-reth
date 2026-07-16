@@ -26,7 +26,7 @@ use reth_engine_tree::engine::EngineApiRequest;
 use reth_node_api::{
     AddOnsContext, BlockTy, EngineApiValidator, EngineTypes, FullNodeComponents, FullNodeTypes,
     NodeAddOns, NodeTypes, NodeTypesWithDBAdapter, PayloadTypes, PayloadValidator, PrimitivesTy,
-    TreeConfig,
+    TreeConfig, TxTy,
 };
 use reth_node_core::{
     cli::config::RethTransactionPoolConfig,
@@ -1474,6 +1474,7 @@ where
             <Node::Types as NodeTypes>::Payload,
             Block = BlockTy<Node::Types>,
         > + Clone,
+    TxTy<Node::Types>: reth_firehose::mapper::SignatureFields,
 {
     type EngineValidator = BasicEngineValidator<Node::Provider, Node::Evm, EV::Validator>;
 
