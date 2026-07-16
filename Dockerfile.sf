@@ -22,7 +22,13 @@
 # Declared before the first FROM so it is usable in the runtime stage's FROM.
 ARG FIREHOSE_ETHEREUM="latest"
 
-FROM lukemathwalker/cargo-chef:latest-rust-1.93 AS chef
+# No cargo-chef here (unlike the streamingfast/reth Dockerfile.sf): this fork
+# patches `reth-metrics` (a workspace path crate) into the `reth-bsc-triedb`
+# git dependency via `[patch."https://github.com/bnb-chain/reth.git"]`, and
+# `cargo chef cook` skeletonizes workspace crates — the stubbed metrics crate
+# then breaks the triedb dependency build. Dependencies are rebuilt from
+# scratch on every image build instead.
+FROM rust:1.93-bookworm AS builder
 WORKDIR /app
 
 LABEL org.opencontainers.image.source=https://github.com/streamingfast/bnb-reth
@@ -31,14 +37,6 @@ LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
 # Install system dependencies
 RUN apt-get update && apt-get install -y libclang-dev pkg-config
 RUN cargo install cargo-auditable
-
-# Builds a cargo-chef plan
-FROM chef AS planner
-COPY --exclude=.git --exclude=dist . .
-RUN cargo chef prepare --recipe-path recipe.json
-
-FROM chef AS builder
-COPY --from=planner /app/recipe.json recipe.json
 
 # Build profile: `maxperf` (full LTO) for release/tag builds, `release` for
 # faster branch/PR builds. Set by sf-release.yml.
@@ -57,9 +55,6 @@ ENV FEATURES=$FEATURES
 # image label on the runtime stage below. `reth` derives its own `--version`
 # string from git metadata at compile time, so this is informational only.
 ARG VERSION="dev"
-
-# Builds dependencies
-RUN cargo chef cook --profile $BUILD_PROFILE --features "$FEATURES" --recipe-path recipe.json
 
 # Build application
 # Platform-specific RUSTFLAGS: amd64 uses x86-64-v3 (Haswell+) with pclmulqdq for rocksdb.
