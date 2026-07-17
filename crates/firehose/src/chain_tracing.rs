@@ -82,6 +82,25 @@ thread_local! {
     /// When set, [`crate::inspector::FirehoseInspector`] hooks become no-ops on this thread.
     /// See [`suspend_tracing`].
     static TRACING_SUSPENDED: Cell<bool> = const { Cell::new(false) };
+    /// Logs committed by chain-driven (deferred system) transactions in the current block.
+    /// See [`add_block_log_offset`].
+    static BLOCK_LOG_OFFSET: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Adds `n` to the block-wide log offset for the current block.
+///
+/// The inspector's internal block log counter only advances through the generic wrapper's
+/// post-tx accounting, which chain-deferred system transactions bypass (the chain executor
+/// emits their traces itself). The chain executor must call this with each system tx's
+/// committed log count so subsequent call logs keep block-accurate indices; the offset resets
+/// automatically when the next block's tracer guard registers.
+pub fn add_block_log_offset(n: u32) {
+    BLOCK_LOG_OFFSET.with(|offset| offset.set(offset.get() + n));
+}
+
+/// Returns the accumulated block log offset for the current block.
+pub(crate) fn block_log_offset() -> u32 {
+    BLOCK_LOG_OFFSET.with(|offset| offset.get())
 }
 
 /// RAII guard returned by [`suspend_tracing`]. Restores the previous suspension state on drop,
@@ -119,6 +138,8 @@ pub(crate) fn is_tracing_suspended() -> bool {
 /// construction; must be paired with [`clear_active_tracer`] (the guard's `Drop` does this).
 pub(crate) fn set_active_tracer(tracer: &mut firehose_tracer::Tracer) {
     ACTIVE_TRACER.with(|slot| slot.set(Some(NonNull::from(tracer))));
+    // New block: reset the per-block system-tx log offset.
+    BLOCK_LOG_OFFSET.with(|offset| offset.set(0));
 }
 
 /// Clears this thread's active tracer registration.

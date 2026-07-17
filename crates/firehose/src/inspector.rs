@@ -419,7 +419,10 @@ impl<'a> FirehoseInspector<'a> {
         for (offset, log) in new_logs.iter().enumerate() {
             // Same block_index formula as `log_full`: a log at per-tx journal
             // index `i` gets `i + log_block_index`. Here `i = trx_logs_count + offset`.
-            let block_index = self.trx_logs_count + offset as u32 + self.log_block_index;
+            let block_index = self.trx_logs_count +
+                offset as u32 +
+                self.log_block_index +
+                crate::chain_tracing::block_log_offset();
             self.tracer.on_log(log.address, log.topics(), &log.data.data, block_index);
         }
         self.trx_logs_count = total;
@@ -1685,7 +1688,9 @@ where
         // a revert get correct indices automatically.
         //
         self.trx_logs_count = context.journal().logs().len() as u32;
-        let block_index = self.trx_logs_count.saturating_sub(1) + self.log_block_index;
+        let block_index = self.trx_logs_count.saturating_sub(1) +
+            self.log_block_index +
+            crate::chain_tracing::block_log_offset();
         self.tracer.on_log(log.address, log.topics(), &log.data.data, block_index);
     }
 

@@ -19,8 +19,8 @@ pub mod runner;
 
 pub use block_tracer::{FirehoseBlockTracer, GlobalTracerGuard};
 pub use chain_tracing::{
-    chain_tracing_config, set_chain_tracing_config, suspend_tracing, with_active_tracer,
-    ChainTracingConfig, TracingSuspensionGuard,
+    add_block_log_offset, chain_tracing_config, set_chain_tracing_config, suspend_tracing,
+    with_active_tracer, ChainTracingConfig, TracingSuspensionGuard,
 };
 pub use executor::{
     run_wrapped_block, ChainHooks, FirehoseBlockExecutor, FirehoseEvmConfig,
