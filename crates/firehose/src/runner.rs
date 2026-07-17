@@ -169,6 +169,10 @@ where
                 use alloy_evm::block::TxResult as _;
                 tx_result.result().result.logs().len() as u32
             };
+            // EIP-4844 blob accounting: only consulted when the chain credits blob fees to the
+            // fee recipient (BSC); pre-Cancun blocks yield None and emit nothing.
+            let blob_gas_used = tx.blob_gas_used().unwrap_or(0);
+            let blob_gas_price = executor.evm().block().blob_gasprice().map(U256::from);
             let (db, inspector, _) = executor.evm_mut().components_mut();
             inspector.process_post_tx_balance_changes(
                 sender,
@@ -178,6 +182,8 @@ where
                 effective_gas_price,
                 base_fee,
                 committed_log_count,
+                blob_gas_used,
+                blob_gas_price,
                 |addr| db.basic(addr).ok().flatten().map(|info| info.balance).unwrap_or(U256::ZERO),
             );
         }

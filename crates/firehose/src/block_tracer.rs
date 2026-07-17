@@ -97,6 +97,10 @@ impl FirehoseBlockTracer<GlobalTracerGuard> {
                 flash_block: None,
             });
         }
+        // Register the tracer as this thread's active tracer so chain executor code that runs
+        // inside block execution (e.g. BSC end-of-block system transactions) can emit through
+        // `crate::with_active_tracer` without re-locking the global. Cleared in Drop.
+        crate::chain_tracing::set_active_tracer(&mut guard);
         Self { guard, status: Status::Started, is_genesis }
     }
 }
@@ -137,6 +141,7 @@ impl<'a> FirehoseBlockTracer<&'a mut firehose_tracer::Tracer> {
                 flash_block: None,
             });
         }
+        crate::chain_tracing::set_active_tracer(tracer);
         Self { guard: tracer, status: Status::Started, is_genesis }
     }
 
@@ -170,6 +175,7 @@ impl<'a> FirehoseBlockTracer<&'a mut firehose_tracer::Tracer> {
                 is_final,
             }),
         });
+        crate::chain_tracing::set_active_tracer(tracer);
         Self { guard: tracer, status: Status::Started, is_genesis: false }
     }
 }
@@ -246,6 +252,8 @@ where
     G: DerefMut<Target = firehose_tracer::Tracer>,
 {
     fn drop(&mut self) {
+        // Always clear the thread-local active-tracer registration made at construction.
+        crate::chain_tracing::clear_active_tracer();
         // Safety net: any early-return path that fails to call mark_verified/mark_failed ends here.
         // Treat it as failure so the block is discarded rather than flushed. Genesis is exempt:
         // `on_genesis_block` was emitted standalone and has no matching end event.
