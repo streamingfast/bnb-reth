@@ -72,7 +72,18 @@ where
         extra: header.extra_data().clone(),
         mix_digest: header.mix_hash().unwrap_or_default(),
         nonce: header.nonce().map(|n| u64::from_be_bytes(n.into())).unwrap_or_default(),
-        base_fee: header.base_fee_per_gas().map(U256::from),
+        // BSC reports a `Some(0)` header base fee as nil to match the geth reference; see
+        // `ChainTracingConfig::treat_zero_base_fee_as_absent`. This omits the header field and
+        // makes dynamic-fee `gas_price` resolve to the fee cap rather than the tip.
+        base_fee: match header.base_fee_per_gas() {
+            Some(0)
+                if crate::chain_tracing::chain_tracing_config()
+                    .is_some_and(|c| c.treat_zero_base_fee_as_absent) =>
+            {
+                None
+            }
+            other => other.map(U256::from),
+        },
         // RLP-encoded length of the sealed block.
         size: block.length() as u64,
         uncles: map_uncles(block),

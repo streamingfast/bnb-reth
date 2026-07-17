@@ -59,6 +59,22 @@ pub struct ChainTracingConfig {
     /// direct reward sweeps — which the chain executor emits itself as transaction traces and
     /// block-level balance changes; a system-call window would swallow them.
     pub trace_finish_in_system_call: bool,
+
+    /// Emit a `Some(0)` header base fee as an absent (nil) base fee in the block event.
+    ///
+    /// BSC (Parlia) has no EIP-1559 base fee, but post-London headers must carry a `0` for
+    /// RLP/consensus, so `header.base_fee_per_gas()` is `Some(0)`. The geth Firehose reference
+    /// instead emits a nil base fee, which has two observable effects the `0` breaks:
+    ///
+    /// * the block header omits the base-fee field (matches geth), and
+    /// * [`firehose_tracer`]'s effective-gas-price rule reports a dynamic-fee transaction's
+    ///   `gas_price` as its fee cap (`max_fee_per_gas`, i.e. geth's `tx.GasPrice()`) instead of
+    ///   `min(max_priority_fee + base_fee, max_fee)` — with `base_fee == 0` the latter collapses
+    ///   to the tip and diverges from geth.
+    ///
+    /// `true` (BSC) maps a `Some(0)` header base fee to `None`; a non-zero base fee is preserved.
+    /// `false` (mainnet Ethereum) forwards the header value unchanged.
+    pub treat_zero_base_fee_as_absent: bool,
 }
 
 static CHAIN_TRACING: OnceLock<ChainTracingConfig> = OnceLock::new();
