@@ -79,6 +79,40 @@ thread_local! {
     /// borrow flag preventing re-entrant use. See [`with_active_tracer`].
     static ACTIVE_TRACER: Cell<Option<NonNull<firehose_tracer::Tracer>>> = const { Cell::new(None) };
     static ACTIVE_TRACER_BORROWED: Cell<bool> = const { Cell::new(false) };
+    /// When set, [`crate::inspector::FirehoseInspector`] hooks become no-ops on this thread.
+    /// See [`suspend_tracing`].
+    static TRACING_SUSPENDED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII guard returned by [`suspend_tracing`]. Restores the previous suspension state on drop,
+/// so nested suspensions compose.
+#[derive(Debug)]
+pub struct TracingSuspensionGuard {
+    prev: bool,
+}
+
+impl Drop for TracingSuspensionGuard {
+    fn drop(&mut self) {
+        TRACING_SUSPENDED.with(|flag| flag.set(self.prev));
+    }
+}
+
+/// Suspends Firehose inspector emissions on this thread until the returned guard drops.
+///
+/// Chain executors use this around *internal* EVM invocations that must not be traced —
+/// consensus bookkeeping reads such as BSC's validator-set / turn-length `eth_call`s, which run
+/// on the same inspector-carrying EVM as real transactions but are invisible in the geth
+/// reference. Without suspension these calls fire inspector hooks while the tracer is between
+/// transactions (block state), which is both a parity break and a tracer state-machine panic
+/// ("caller expected to be in transaction state").
+pub fn suspend_tracing() -> TracingSuspensionGuard {
+    let prev = TRACING_SUSPENDED.with(|flag| flag.replace(true));
+    TracingSuspensionGuard { prev }
+}
+
+/// Returns `true` while a [`TracingSuspensionGuard`] is alive on this thread.
+pub(crate) fn is_tracing_suspended() -> bool {
+    TRACING_SUSPENDED.with(|flag| flag.get())
 }
 
 /// Registers `tracer` as this thread's active tracer. Called by the block tracer guard on
