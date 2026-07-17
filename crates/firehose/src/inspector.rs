@@ -1298,6 +1298,10 @@ where
 {
     /// Called before each opcode executes (equivalent to Geth's OnOpcode hook)
     fn step(&mut self, interp: &mut Interpreter<EthInterpreter>, context: &mut CTX) {
+        // Suspended: internal consensus EVM invocation (see chain_tracing::suspend_tracing).
+        if crate::chain_tracing::is_tracing_suspended() {
+            return;
+        }
         // On the first step of a new call frame, process journal changes to capture
         // the value transfer BalanceTransfer pushed by frame_init after call/create returned.
         // This must happen before any revert could remove the entry.
@@ -1333,6 +1337,10 @@ where
 
     /// Called after each opcode executes; used to detect SSTORE and SELFDESTRUCT state changes.
     fn step_end(&mut self, interp: &mut Interpreter<EthInterpreter>, context: &mut CTX) {
+        // Suspended: internal consensus EVM invocation (see chain_tracing::suspend_tracing).
+        if crate::chain_tracing::is_tracing_suspended() {
+            return;
+        }
         let step_ctx = match self.last_step.take() {
             Some(ctx) => ctx,
             None => return,
@@ -1382,6 +1390,10 @@ where
 
     /// CALL, CALLCODE, DELEGATECALL, or STATICCALL is made
     fn call(&mut self, context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
+        // Suspended: internal consensus EVM invocation (see chain_tracing::suspend_tracing).
+        if crate::chain_tracing::is_tracing_suspended() {
+            return None;
+        }
         use reth_revm::revm::interpreter::CallScheme;
 
         let depth = context.journal().depth() as i32;
@@ -1462,6 +1474,10 @@ where
 
     /// CALL* operation completes
     fn call_end(&mut self, context: &mut CTX, _inputs: &CallInputs, outcome: &mut CallOutcome) {
+        // Suspended: internal consensus EVM invocation (see chain_tracing::suspend_tracing).
+        if crate::chain_tracing::is_tracing_suspended() {
+            return;
+        }
         log_journal("call_exit", context);
 
         // Scan journal entries accumulated during this call's execution BEFORE popping it,
@@ -1549,6 +1565,10 @@ where
 
     /// CREATE or CREATE2 is made
     fn create(&mut self, context: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
+        // Suspended: internal consensus EVM invocation (see chain_tracing::suspend_tracing).
+        if crate::chain_tracing::is_tracing_suspended() {
+            return None;
+        }
         use reth_revm::revm::context_interface::CreateScheme;
 
         let depth = context.journal().depth() as i32;
@@ -1599,6 +1619,10 @@ where
         _inputs: &CreateInputs,
         outcome: &mut CreateOutcome,
     ) {
+        // Suspended: internal consensus EVM invocation (see chain_tracing::suspend_tracing).
+        if crate::chain_tracing::is_tracing_suspended() {
+            return;
+        }
         log_journal("create_exit", context);
 
         // Scan journal entries accumulated during this create's execution (including the
@@ -1651,6 +1675,10 @@ where
         context: &mut CTX,
         log: AlloyLog,
     ) {
+        // Suspended: internal consensus EVM invocation (see chain_tracing::suspend_tracing).
+        if crate::chain_tracing::is_tracing_suspended() {
+            return;
+        }
         // The journal tracks all non-reverted logs. log_full fires after the
         // log is appended, so logs().len() - 1 is this log's index in the transaction.
         // On revert, the journal truncates logs back, so subsequent logs after
@@ -1663,6 +1691,10 @@ where
 
     /// SELFDESTRUCT is executed
     fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
+        // Suspended: internal consensus EVM invocation (see chain_tracing::suspend_tracing).
+        if crate::chain_tracing::is_tracing_suspended() {
+            return;
+        }
         // Note: selfdestruct_addresses is populated in process_selfdestruct_balance_changes
         // (only for AccountDestroyed entries, not BalanceTransfer), because post-Cancun
         // non-locally-created contracts are NOT destroyed and don't need cleanup.
