@@ -7,15 +7,19 @@ This changelog covers Firehose-specific changes only. For upstream changes, see 
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## v0.0.10-fh-beta
+## Unreleased
+
+This fork is consumed as a library by
+[streamingfast/reth-bsc](https://github.com/streamingfast/reth-bsc), which builds the
+Firehose-instrumented `reth-bsc` binary and Docker image; no binaries or images are
+released from this repository.
 
 ### Added
 
 - Initial Firehose instrumentation on top of bnb-chain/reth `v0.0.10`, ported from
   streamingfast/reth `firehose/2.x` (`v2.3.0-fh-6`). Includes the `reth-firehose` crate
   (inspector, block tracer, executor wrappers, ExEx), live engine-tree tracing on both the
-  standard and triedb validation paths, pipeline (staged sync) tracing, and the
-  `Dockerfile.sf` / `sf-release.yml` image build that bundles `fireeth`.
+  standard and triedb validation paths, and pipeline (staged sync) tracing.
 
 ### Changed
 
