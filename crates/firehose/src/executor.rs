@@ -267,6 +267,7 @@ where
             max_priority_fee_per_gas,
             gas_price_opt,
             gas_limit,
+            to,
             blob_gas_used,
             mut tx_event,
         ) = {
@@ -279,6 +280,7 @@ where
                 inner_tx.max_priority_fee_per_gas().unwrap_or(0),
                 inner_tx.gas_price(),
                 inner_tx.gas_limit(),
+                inner_tx.to(),
                 // EIP-4844: total blob gas consumed by this tx (num_blobs × GAS_PER_BLOB); 0 for
                 // non-blob tx types. Geth populates `receipt.BlobGasUsed` from this value.
                 inner_tx.blob_gas_used().unwrap_or(0),
@@ -292,6 +294,21 @@ where
         // `blob_gasprice()` returns `None` for pre-Cancun blocks, matching Geth's omission of
         // the field on pre-Cancun receipts.
         let blob_gas_price = self.inner.evm().block().blob_gasprice().map(U256::from);
+
+        // Chain-deferred consensus system transactions (BSC): the inner executor buffers these
+        // during body iteration and executes them itself inside `finish()`; the chain executor
+        // emits the tx trace at that point (matching geth, which traces system txs when the
+        // consensus engine applies them). Emit nothing here — just delegate so the inner
+        // executor's buffering still happens.
+        if let Some(cfg) = crate::chain_tracing::chain_tracing_config() {
+            if (cfg.is_deferred_system_tx)(to, max_fee_per_gas, sender, coinbase) {
+                let result = self.inner.execute_transaction_without_commit((tx_env, recovered))?;
+                if !f(&result).should_commit() {
+                    return Ok(None);
+                }
+                return Ok(Some(self.inner.commit_transaction(result)));
+            }
+        }
 
         // Chain-specific pre-tx patching of the event (e.g. OP Stack deposit nonce override).
         // Runs after the envelope-derived mapper and before `on_tx_start` so the tracer sees the
@@ -331,6 +348,8 @@ where
                 effective_gas_price,
                 base_fee,
                 committed_log_count,
+                blob_gas_used,
+                blob_gas_price,
                 &mut get_pre,
             );
         }
@@ -385,14 +404,26 @@ where
         // Open the post-execution system-call window (EIP-4895 withdrawals, EIP-7251 consolidation
         // requests, etc.). Close it AFTER the inner finish so inner post-execution work lands
         // inside the window.
-        self.inner.evm_mut().inspector_mut().tracer_mut().on_system_call_start();
+        //
+        // Chains whose `finish()` runs consensus finalization instead of EVM system calls (BSC:
+        // deferred system transactions + direct reward sweeps, emitted by the chain executor
+        // itself) disable the window via `ChainTracingConfig::trace_finish_in_system_call` —
+        // otherwise their tx traces and block-level balance changes would be swallowed by it.
+        let wrap_finish = crate::chain_tracing::chain_tracing_config()
+            .map(|c| c.trace_finish_in_system_call)
+            .unwrap_or(true);
+        if wrap_finish {
+            self.inner.evm_mut().inspector_mut().tracer_mut().on_system_call_start();
+        }
 
         let (mut evm, exec_result) = self.inner.finish()?;
 
         // Close the window before emitting withdrawal balance changes so that on_balance_change
         // routes them to `block.balance_changes` (not `deferred_call_state`, which would be
         // discarded).
-        evm.inspector_mut().tracer_mut().on_system_call_end();
+        if wrap_finish {
+            evm.inspector_mut().tracer_mut().on_system_call_end();
+        }
 
         // EIP-4895 validator withdrawals are applied via db.increment_balances() inside the
         // inner finish(), bypassing the EVM journal — the inspector never sees them.

@@ -1044,6 +1044,7 @@ impl<'a> FirehoseInspector<'a> {
     /// the next transaction. `tx_journal_snapshot` is deliberately left in place here (the
     /// post-tx extras hook, which runs after this method, still needs it) and is instead
     /// cleared at the start of the next tx in `enter_frame_pre_hook` (depth 0).
+    #[expect(clippy::too_many_arguments)]
     pub fn process_post_tx_balance_changes<F>(
         &mut self,
         sender: Address,
@@ -1053,11 +1054,19 @@ impl<'a> FirehoseInspector<'a> {
         effective_gas_price: u128,
         base_fee: u64,
         committed_log_count: u32,
+        blob_gas_used: u64,
+        blob_gas_price: Option<U256>,
         mut get_pre_tx_balance: F,
     ) where
         F: FnMut(Address) -> U256,
     {
         use pb::sf::ethereum::r#type::v2::balance_change::Reason;
+
+        // Chain override (BSC): tx fees are credited to a fixed consensus address
+        // (SYSTEM_ADDRESS, 0xffff…fffe) instead of the block beneficiary; the consensus engine
+        // sweeps them to the validator later. See `crate::chain_tracing`.
+        let chain_cfg = crate::chain_tracing::chain_tracing_config();
+        let coinbase = chain_cfg.and_then(|c| c.fee_recipient).unwrap_or(coinbase);
 
         let gas_buy_cost = U256::from(gas_limit) * U256::from(effective_gas_price);
         let remaining_gas = gas_limit.saturating_sub(gas_used);
@@ -1118,6 +1127,44 @@ impl<'a> FirehoseInspector<'a> {
                 new_balance,
                 Reason::RewardTransactionFee,
             );
+        }
+
+        // Chain override (BSC): the EIP-4844 blob fee is credited to the fee recipient instead
+        // of being burned. Geth emits it right after the tip credit with
+        // REASON_REWARD_BLOB_FEE (core/state_transition.go, `IsInBSC` branch).
+        if chain_cfg.is_some_and(|c| c.reward_blob_fee) && blob_gas_used > 0 {
+            if let Some(blob_gas_price) = blob_gas_price {
+                let blob_fee = U256::from(blob_gas_used) * blob_gas_price;
+                if !blob_fee.is_zero() {
+                    // Old balance: the recipient's balance after the tip credit above (or the
+                    // journal-derived post-tx balance when no tip was emitted).
+                    let priority_fee_per_gas = effective_gas_price.saturating_sub(base_fee as u128);
+                    let tip_amount = if gas_used > 0 && priority_fee_per_gas > 0 {
+                        U256::from(gas_used) * U256::from(priority_fee_per_gas)
+                    } else {
+                        U256::ZERO
+                    };
+                    let base = if sender == coinbase {
+                        sender_balance + refund_amount
+                    } else {
+                        Self::resolve_post_tx_balance(
+                            coinbase,
+                            None,
+                            U256::ZERO,
+                            &self.tx_journal_snapshot,
+                            &mut get_pre_tx_balance,
+                        )
+                    };
+                    let old_balance = base + tip_amount;
+                    let new_balance = old_balance + blob_fee;
+                    self.tracer.on_balance_change(
+                        coinbase,
+                        old_balance,
+                        new_balance,
+                        Reason::RewardBlobFee,
+                    );
+                }
+            }
         }
 
         // Emit nonce reset and code clearing for self-destructed accounts.
@@ -1659,6 +1706,7 @@ pub trait FirehoseInspectorApi {
     /// `get_pre_tx_balance` is passed as a trait object so the call site does not need to be
     /// generic over `F`, keeping the wrapper's signature free of extra type parameters.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn process_post_tx_balance_changes_erased(
         &mut self,
         sender: Address,
@@ -1668,6 +1716,8 @@ pub trait FirehoseInspectorApi {
         effective_gas_price: u128,
         base_fee: u64,
         committed_log_count: u32,
+        blob_gas_used: u64,
+        blob_gas_price: Option<U256>,
         get_pre_tx_balance: &mut dyn FnMut(Address) -> U256,
     );
 
@@ -1705,6 +1755,8 @@ impl<'a> FirehoseInspectorApi for FirehoseInspector<'a> {
         effective_gas_price: u128,
         base_fee: u64,
         committed_log_count: u32,
+        blob_gas_used: u64,
+        blob_gas_price: Option<U256>,
         get_pre_tx_balance: &mut dyn FnMut(Address) -> U256,
     ) {
         self.process_post_tx_balance_changes(
@@ -1715,6 +1767,8 @@ impl<'a> FirehoseInspectorApi for FirehoseInspector<'a> {
             effective_gas_price,
             base_fee,
             committed_log_count,
+            blob_gas_used,
+            blob_gas_price,
             |addr| get_pre_tx_balance(addr),
         );
     }

@@ -4,6 +4,8 @@
 
 /// Block-level drop guard that manages the Firehose tracer lifecycle across validation.
 pub mod block_tracer;
+
+pub mod chain_tracing;
 /// Executor module with Firehose-aware block executors and EVM configs.
 pub mod executor;
 /// Inspector module for analyzing blockchain data.
@@ -16,6 +18,9 @@ pub mod prelude;
 pub mod runner;
 
 pub use block_tracer::{FirehoseBlockTracer, GlobalTracerGuard};
+pub use chain_tracing::{
+    chain_tracing_config, set_chain_tracing_config, with_active_tracer, ChainTracingConfig,
+};
 pub use executor::{
     run_wrapped_block, ChainHooks, FirehoseBlockExecutor, FirehoseEvmConfig,
     FirehoseWrappedExecutor, NoChainHooks, NoPostTxExtras, NoPreTxAdjust, PostTxExtras,
