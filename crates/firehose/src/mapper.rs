@@ -10,7 +10,6 @@ use alloy_consensus::{
 };
 use alloy_genesis::Genesis;
 use alloy_primitives::{Address, Bytes, Sealable, B256, U256};
-use alloy_rlp::Encodable;
 use firehose_tracer::types::{
     AccessTuple, BlockData, GenesisAlloc, SetCodeAuthorization, TxEvent, UncleData, WithdrawalData,
 };
@@ -85,7 +84,10 @@ where
             other => other.map(U256::from),
         },
         // RLP-encoded length of the sealed block.
-        size: block.length() as u64,
+        // `rlp_length()` is the canonical block size (`Block::rlp_length`), which chains define to
+        // exclude data that is not part of the canonical block — on BSC that is blob sidecars,
+        // matching geth's `size`. `length()` (the RLP encode length) would include them.
+        size: block.rlp_length() as u64,
         uncles: map_uncles(block),
         withdrawals: map_withdrawals(block),
         withdrawals_root: header.withdrawals_root(),
