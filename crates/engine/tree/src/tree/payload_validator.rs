@@ -1554,21 +1554,33 @@ where
         let execution_start = Instant::now();
 
         // Execute all transactions and finalize
-        let (executor, senders) = self.execute_transactions(
+        let (executor, senders, last_sent_len) = self.execute_transactions(
             executor,
             transaction_count,
             handle.iter_transactions(),
             &receipt_tx,
             &executed_tx_index,
         )?;
-        drop(receipt_tx);
 
-        // Finish execution and get the result
+        // Finish execution and get the result. `receipt_tx` is kept alive across this
+        // call: some executors (e.g. BSC) append additional receipts here (a system
+        // transaction's receipt) that were never streamed by the main loop above.
+        // (Mirrors `execute_block`, per the MAINTENANCE CONTRACT above.)
         let post_exec_start = Instant::now();
         let (_evm, result) = debug_span!(target: "engine::tree", "BlockExecutor::finish")
             .in_scope(|| executor.finish())
             .map(|(evm, result)| (evm.into_db(), result))?;
         self.metrics.record_post_execution(post_exec_start.elapsed());
+
+        // Stream any receipts that were only appended during finalization, so the
+        // receipt-root task still receives the complete set instead of always
+        // finalizing short.
+        if result.receipts.len() > last_sent_len {
+            for (tx_index, receipt) in result.receipts.iter().enumerate().skip(last_sent_len) {
+                let _ = receipt_tx.send(IndexedReceipt::new(tx_index, receipt.clone()));
+            }
+        }
+        drop(receipt_tx);
 
         // Merge transitions into bundle state
         debug_span!(target: "engine::tree", "merge_transitions")
