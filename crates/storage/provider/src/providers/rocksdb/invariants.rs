@@ -173,6 +173,12 @@ impl RocksDBProvider {
             return Ok(Some(sf_tip));
         }
 
+        // Nothing indexed at all, so there is no excess to prune. Skips the whole scan on a node
+        // that has static files far ahead of an unstarted TransactionLookup stage.
+        if self.first::<tables::TransactionHashNumbers>()?.is_none() {
+            return Ok(None);
+        }
+
         tracing::info!(
             target: "reth::providers::rocksdb",
             checkpoint,
@@ -195,7 +201,17 @@ impl RocksDBProvider {
                 "Pruning TransactionHashNumbers batch"
             );
 
-            self.prune_transaction_hash_numbers_in_range(provider, batch_start..=batch_end)?;
+            let deleted =
+                self.prune_transaction_hash_numbers_in_range(provider, batch_start..=batch_end)?;
+
+            // Entries are written in ascending tx order, so any excess above the checkpoint is
+            // contiguous. A batch holding no stored hash means we are past everything RocksDB
+            // actually contains; continuing would only decompress and hash static file
+            // transactions for no effect, which can mean billions of transactions when the
+            // checkpoint is far behind the static file tip.
+            if deleted == 0 {
+                break;
+            }
 
             batch_start = batch_end.saturating_add(1);
         }
@@ -210,6 +226,8 @@ impl RocksDBProvider {
     /// scalable than iterating all rows because it only processes the transactions that
     /// need to be pruned.
     ///
+    /// Returns the number of entries actually deleted.
+    ///
     /// # Requirements
     ///
     /// The provider must be able to supply transaction data (typically from static files)
@@ -219,12 +237,12 @@ impl RocksDBProvider {
         &self,
         provider: &Provider,
         tx_range: std::ops::RangeInclusive<u64>,
-    ) -> ProviderResult<()>
+    ) -> ProviderResult<usize>
     where
         Provider: TransactionsProvider<Transaction: Encodable2718>,
     {
         if tx_range.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         // Fetch transactions in the range and compute their hashes in parallel
@@ -234,23 +252,36 @@ impl RocksDBProvider {
             .map(|tx| tx.trie_hash())
             .collect();
 
-        if !hashes.is_empty() {
+        // Only delete hashes that are actually stored: point lookups are answered by RocksDB's
+        // bloom filters, whereas blind deletes write a tombstone per transaction in the range and
+        // hide whether anything was there to begin with.
+        let stored = hashes
+            .into_par_iter()
+            .map(|hash| {
+                Ok(self.get::<tables::TransactionHashNumbers>(hash)?.is_some().then_some(hash))
+            })
+            .collect::<ProviderResult<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        if !stored.is_empty() {
             tracing::info!(
                 target: "reth::providers::rocksdb",
-                deleted_count = hashes.len(),
+                deleted_count = stored.len(),
                 tx_range_start = *tx_range.start(),
                 tx_range_end = *tx_range.end(),
                 "Pruning TransactionHashNumbers entries by tx range"
             );
 
             let mut batch = self.batch();
-            for hash in hashes {
-                batch.delete::<tables::TransactionHashNumbers>(hash)?;
+            for hash in &stored {
+                batch.delete::<tables::TransactionHashNumbers>(*hash)?;
             }
             batch.commit()?;
         }
 
-        Ok(())
+        Ok(stored.len())
     }
 
     /// Heals the `StoragesHistory` table by removing stale entries.
@@ -1084,6 +1115,60 @@ mod tests {
             max_tx_to_keep + 1,
             max_tx_to_keep
         );
+    }
+
+    /// Tests that pruning a range `RocksDB` has no entries for reports zero deletions, which is
+    /// what stops the healing loop from scanning static files up to their tip.
+    #[test]
+    fn test_prune_transaction_hash_numbers_reports_zero_for_unindexed_range() {
+        let temp_dir = TempDir::new().unwrap();
+        let rocksdb = RocksDBBuilder::new(temp_dir.path())
+            .with_table::<tables::TransactionHashNumbers>()
+            .build()
+            .unwrap();
+
+        let factory = create_test_provider_factory();
+        factory.set_storage_settings_cache(StorageSettings::v2());
+
+        let mut rng = generators::rng();
+        let blocks = generators::random_block_range(
+            &mut rng,
+            0..=5,
+            BlockRangeParams { parent: Some(B256::ZERO), tx_count: 2..3, ..Default::default() },
+        );
+
+        // Index only the first 6 transactions (blocks 0-2), leaving tx 6-11 unindexed.
+        let mut tx_count = 0u64;
+        {
+            let provider = factory.database_provider_rw().unwrap();
+            for block in &blocks {
+                provider
+                    .insert_block(&block.clone().try_recover().expect("recover block"))
+                    .unwrap();
+                for tx in &block.body().transactions {
+                    if tx_count < 6 {
+                        rocksdb
+                            .put::<tables::TransactionHashNumbers>(tx.trie_hash(), &tx_count)
+                            .unwrap();
+                    }
+                    tx_count += 1;
+                }
+            }
+            provider.commit().unwrap();
+        }
+
+        let provider = factory.database_provider_ro().unwrap();
+
+        let deleted = rocksdb
+            .prune_transaction_hash_numbers_in_range(&provider, 6..=(tx_count - 1))
+            .expect("prune should succeed");
+        assert_eq!(deleted, 0, "range without indexed entries should report no deletions");
+
+        let deleted = rocksdb
+            .prune_transaction_hash_numbers_in_range(&provider, 3..=5)
+            .expect("prune should succeed");
+        assert_eq!(deleted, 3, "indexed entries in range should be deleted");
+        assert_eq!(rocksdb.iter::<tables::TransactionHashNumbers>().unwrap().count(), 3);
     }
 
     #[test]
