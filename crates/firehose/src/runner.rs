@@ -241,11 +241,17 @@ where
     SignedTx<Node>: mapper::SignatureFields,
 {
     let chain_id = ctx.config.chain.chain().id();
-    crate::tracer().on_blockchain_init(
-        "reth",
-        env!("CARGO_PKG_VERSION"),
-        firehose_tracer::config::ChainConfig::new(chain_id),
-    );
+    // Kill-switch (FIREHOSE_DISABLED): the tracer was never initialized. Keep the ExEx alive to
+    // consume notifications and advance FinishedHeight (so the WAL prunes), but emit nothing.
+    if !crate::is_tracer_initialized() {
+        info!(target: "firehose", "tracer not initialized; firehose ExEx running in no-op mode");
+    } else {
+        crate::tracer().on_blockchain_init(
+            "reth",
+            env!("CARGO_PKG_VERSION"),
+            firehose_tracer::config::ChainConfig::new(chain_id),
+        );
+    }
 
     while let Some(notification) = ctx.notifications.next().await {
         let notification = notification?;
