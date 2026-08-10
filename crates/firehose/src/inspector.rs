@@ -993,7 +993,21 @@ impl<'a> FirehoseInspector<'a> {
                         *b = b.saturating_add(*amount);
                     }
                 }
-                // SELFDESTRUCT: contract's balance was zeroed.
+                // SELFDESTRUCT beneficiary: revm credits `target` in place and records the
+                // move only inside `AccountDestroyed` — no `BalanceTransfer` entry is pushed
+                // on the truly-destroyed path (EIP-6780: contract created in the same tx, or
+                // pre-Cancun). Without this arm a coinbase/sender that received a suicide
+                // refund resolves to its stale pre-refund balance, so the following
+                // RewardTransactionFee/GasRefund event reports an `old_balance` that
+                // contradicts the SuicideRefund event emitted moments earlier.
+                JournalEntry::AccountDestroyed {
+                    address: destroyed, target, had_balance, ..
+                } if *target == address && *destroyed != address => {
+                    let b = balance.get_or_insert_with(|| get_pre_tx_balance(address));
+                    *b = b.saturating_add(*had_balance);
+                }
+                // SELFDESTRUCT: contract's balance was zeroed. Also covers the
+                // self-beneficiary case (`target == address`), where the balance is burned.
                 JournalEntry::AccountDestroyed { address: a, .. } if *a == address => {
                     balance = Some(U256::ZERO);
                 }
@@ -2195,6 +2209,86 @@ mod tests {
                 &mut get_pre,
             ),
             pre_tx,
+        );
+    }
+
+    /// SELFDESTRUCT refund into the coinbase (or the sender): on the truly-destroyed path
+    /// revm credits `target` in place and pushes only `AccountDestroyed` — no
+    /// `BalanceTransfer`. The resolver must replay that credit, otherwise the
+    /// `RewardTransactionFee` event that follows carries a stale `old_balance`.
+    ///
+    /// Live-block regression from streamingfast/reth (Ethereum mainnet block 25690108):
+    /// 0x8707c2bd… selfdestructed 0x690f7d1c42ce88 into the coinbase 0x4838b106…. geth
+    /// reports the reward with `old=0x4752e5600c77bf43`; pre-fix reth resolved the reward's
+    /// `old_balance` back to 0x46e9d5e2f034f0bb, silently dropping the refund.
+    #[test]
+    fn resolve_post_tx_balance_credits_selfdestruct_beneficiary() {
+        use reth_revm::revm::context_interface::journaled_state::entry::SelfdestructionRevertStatus;
+
+        let coinbase = addr(0x48);
+        let destroyed = addr(0x87);
+        let pre_tx = U256::from(0x46e9d5e2f034f0bb_u64);
+        let refund = U256::from(0x690f7d1c42ce88_u64);
+
+        let journal = vec![JournalEntry::AccountDestroyed {
+            had_balance: refund,
+            address: destroyed,
+            target: coinbase,
+            destroyed_status: SelfdestructionRevertStatus::GloballySelfdestroyed,
+        }];
+        let mut get_pre = |_: Address| pre_tx;
+
+        assert_eq!(
+            FirehoseInspector::resolve_post_tx_balance(
+                coinbase,
+                None,
+                U256::ZERO,
+                &journal,
+                &mut get_pre,
+            ),
+            U256::from(0x4752e5600c77bf43_u64),
+            "coinbase reward old_balance must include the suicide refund"
+        );
+
+        // The destroyed account itself still resolves to zero.
+        assert_eq!(
+            FirehoseInspector::resolve_post_tx_balance(
+                destroyed,
+                None,
+                U256::ZERO,
+                &journal,
+                &mut get_pre,
+            ),
+            U256::ZERO,
+        );
+    }
+
+    /// Self-beneficiary SELFDESTRUCT (`target == address`): the balance is burned, not
+    /// credited. The beneficiary arm must not fire and re-add it.
+    #[test]
+    fn resolve_post_tx_balance_selfdestruct_to_self_burns() {
+        use reth_revm::revm::context_interface::journaled_state::entry::SelfdestructionRevertStatus;
+
+        let account = addr(0x87);
+        let pre_tx = U256::from(0x1000_u64);
+
+        let journal = vec![JournalEntry::AccountDestroyed {
+            had_balance: pre_tx,
+            address: account,
+            target: account,
+            destroyed_status: SelfdestructionRevertStatus::GloballySelfdestroyed,
+        }];
+        let mut get_pre = |_: Address| pre_tx;
+
+        assert_eq!(
+            FirehoseInspector::resolve_post_tx_balance(
+                account,
+                None,
+                U256::ZERO,
+                &journal,
+                &mut get_pre,
+            ),
+            U256::ZERO,
         );
     }
 
