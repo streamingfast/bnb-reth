@@ -14,6 +14,17 @@ This fork is consumed as a library by
 Firehose-instrumented `reth-bsc` binary and Docker image; no binaries or images are
 released from this repository.
 
+### Fixed
+
+- Include the SELFDESTRUCT refund when resolving an account's post-transaction balance. On
+  the truly-destroyed path (EIP-6780: contract created in the same transaction, or
+  pre-Cancun) revm credits the beneficiary in place and records the move only inside its
+  `AccountDestroyed` journal entry — no `BalanceTransfer` is pushed — so the journal walk
+  backing the `RewardTransactionFee` and `GasRefund` events missed it. A coinbase or sender
+  that received a suicide refund then reported an `old_balance` contradicting the
+  `SuicideRefund` event emitted moments earlier. Ported from streamingfast/reth
+  `v2.3.0-fh-7`.
+
 ### Added
 
 - Initial Firehose instrumentation on top of bnb-chain/reth `v0.0.10`, ported from
